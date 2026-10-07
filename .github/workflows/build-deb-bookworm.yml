@@ -21,6 +21,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates curl git build-essential pkg-config cmake clang libclang-dev \
             libasound2-dev libpulse-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxext-dev libgl1-mesa-dev \
             desktop-file-utils hicolor-icon-theme
 
       - name: Install Rust
