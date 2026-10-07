@@ -1,81 +1,391 @@
-name: Build Debian package (bookworm)
+name: Build Spotifast .deb for Bookworm
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege. The job needs contents:write solely because it attaches the
+# .deb to a GitHub Release on v* tags; drop the release step if you want read-only.
+permissions:
+  contents: write
+
+# Cancel superseded runs on the same ref (full Rust build is ~15 min).
+concurrency:
+  group: bookworm-deb-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Highest glibc the resulting binary may require (Debian 12 = 2.36).
+  MAX_GLIBC: "2.36"
+  CARGO_HOME: /github/home/.cargo
+  CARGO_TARGET_DIR: /tmp/cargo-target
+  # Fixed epoch for reproducible timestamps.
+  SOURCE_DATE_EPOCH: "1704067200"
 
 jobs:
-  deb-bookworm:
-    # Building inside a bookworm container keeps the produced binary linked
-    # against glibc 2.36, so the .deb runs on Debian 12 (GitHub's own runners
-    # have glibc 2.39, which Debian 12 cannot load).
+  build-deb:
+    # ubuntu-latest has glibc 2.39, so the *container* is what pins the ABI.
     runs-on: ubuntu-latest
     container:
-      image: debian:bookworm
+      image: debian:bookworm@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858
+      options: --user root
+
     steps:
+      # ── Guard 1: the container itself must not be newer than MAX_GLIBC ──
+      - name: Assert container glibc <= ${{ env.MAX_GLIBC }}
+        run: |
+          set -euo pipefail
+          GLIBC_VER="$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+$' | head -1)"
+          echo "Container glibc: ${GLIBC_VER}"
+          HIGHEST="$(printf '%s\n%s\n' "${GLIBC_VER}" "${{ env.MAX_GLIBC }}" | sort -V | tail -1)"
+          if [ "${HIGHEST}" != "${{ env.MAX_GLIBC }}" ]; then
+            echo "::error::Container glibc ${GLIBC_VER} is newer than the allowed ${{ env.MAX_GLIBC }}"
+            exit 1
+          fi
+          echo "glibc ${GLIBC_VER} is acceptable"
+
+      # ── Build dependencies (X11/GL headers are required by libprojectM) ──
       - name: Install build dependencies
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl git build-essential pkg-config cmake clang libclang-dev \
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config cmake \
+            clang libclang-dev \
             libasound2-dev libpulse-dev libxkbcommon-dev libwayland-dev \
             libx11-dev libxext-dev libgl1-mesa-dev \
-            desktop-file-utils hicolor-icon-theme
+            desktop-file-utils hicolor-icon-theme \
+            lintian xvfb file dpkg-dev binutils
+          # NOTE: apt lists are deliberately kept: the smoke test needs
+          # `apt-get install -f` to be able to resolve dependencies.
 
-      - name: Install Rust
+      # ── rustup without a toolchain; the pinned one comes from the repo ──
+      - name: Install rustup
         run: |
+          set -euo pipefail
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          echo "CARGO_HOME=/github/home/.cargo" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_DIR=/tmp/cargo-target" >> "$GITHUB_ENV"
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "PATH=${CARGO_HOME}/bin:${PATH}" >> "${GITHUB_PATH}"
 
-      - uses: actions/checkout@v4
-
-      # Keeps the ~15 min Rust build off the critical path on reruns.
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build Spotifast
-        run: cargo build --release --locked
-
-      - name: Assemble .deb
-        run: |
-          set -eu
-          version=$(awk '/^\[package\]/{f=1;next} f&&/^version *=/{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml)
-          case "$GITHUB_REF_NAME" in v[0-9]*) version=${GITHUB_REF_NAME#v} ;; esac
-          pkgroot=/tmp/pkg
-          mkdir -p "$pkgroot/DEBIAN" "$pkgroot/usr/bin" \
-                   "$pkgroot/usr/share/applications" \
-                   "$pkgroot/usr/share/icons/hicolor/scalable/apps"
-          install -m755 "$CARGO_TARGET_DIR/release/spotifast" "$pkgroot/usr/bin/spotifast"
-          install -m644 packaging/applications/spotifast.desktop \
-            "$pkgroot/usr/share/applications/spotifast.desktop"
-          install -m644 packaging/icons/spotifast.svg \
-            "$pkgroot/usr/share/icons/hicolor/scalable/apps/spotifast.svg"
-          cat > "$pkgroot/DEBIAN/control" <<EOF
-          Package: spotifast
-          Version: $version
-          Section: sound
-          Priority: optional
-          Architecture: amd64
-          Maintainer: spotifast-ci <ci@example.com>
-          Depends: libc6 (>= 2.36), libasound2, libpulse0, libxkbcommon0, libwayland-client0
-          Description: A fast native Spotify desktop client
-           A native desktop client for Spotify, built from the upstream source
-           against glibc 2.36 so it installs on Debian 12.
-          EOF
-          printf '%s\n' "/usr/bin/spotifast" > "$pkgroot/DEBIAN/postinst"
-          printf '#!/bin/sh\nset -e\nif command -v update-desktop-database >/dev/null; then update-desktop-database -q /usr/share/applications || true; fi\nif command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true; fi\nexit 0\n' > "$pkgroot/DEBIAN/postrm"
-          chmod 755 "$pkgroot/DEBIAN/postinst" "$pkgroot/DEBIAN/postrm"
-          out="spotifast_${version}_bookworm_amd64.deb"
-          dpkg-deb --build --root-owner-group "$pkgroot" "$out"
-          dpkg-deb --info "$out"
-          echo "GLIBC symbols used (max):"
-          objdump -T "$pkgroot/usr/bin/spotifast" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1
-
-      - uses: actions/upload-artifact@v4
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: spotifast-bookworm-deb
-          path: '*.deb'
+          fetch-depth: 0
+
+      # ── Exact toolchain pinned by the repository (rust-toolchain.toml) ──
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          echo "rust-toolchain.toml:"
+          cat rust-toolchain.toml
+          CHANNEL="$(sed -n 's/.*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)"
+          if [ -z "${CHANNEL}" ]; then
+            echo "::warning::no channel in rust-toolchain.toml; falling back to stable"
+            CHANNEL=stable
+          fi
+          echo "Installing toolchain: ${CHANNEL}"
+          rustup toolchain install "${CHANNEL}" --profile minimal
+          rustup default "${CHANNEL}"
+          rustc --version
+          cargo --version
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> /tmp/cargo-target"
+          shared-key: bookworm-release
+
+      - name: Build release binary
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-C debuginfo=0"
+          export SOURCE_DATE_EPOCH
+          cargo build --release --locked
+          BINARY="${CARGO_TARGET_DIR}/release/spotifast"
+          if [ ! -f "${BINARY}" ]; then
+            echo "::error::binary not found at ${BINARY}"
+            ls -la "${CARGO_TARGET_DIR}/release/" 2>/dev/null | head -30 || true
+            exit 1
+          fi
+          file "${BINARY}"
+          ls -lh "${BINARY}"
+
+      # ── Guard 2: the real guarantee — no symbol above MAX_GLIBC ──
+      - name: Assert max glibc symbol <= ${{ env.MAX_GLIBC }}
+        run: |
+          set -euo pipefail
+          BINARY="${CARGO_TARGET_DIR}/release/spotifast"
+          MAX_SYM="$(objdump -T "${BINARY}" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)"
+          echo "Max GLIBC symbol required: ${MAX_SYM}"
+          echo "Max allowed:               ${{ env.MAX_GLIBC }}"
+          if [ -z "${MAX_SYM}" ]; then
+            echo "::error::could not read dynamic symbols; refusing to ship an unverified binary"
+            exit 1
+          fi
+          HIGHEST="$(printf '%s\n%s\n' "${MAX_SYM}" "${{ env.MAX_GLIBC }}" | sort -V | tail -1)"
+          if [ "${HIGHEST}" != "${{ env.MAX_GLIBC }}" ]; then
+            echo "::error::binary requires GLIBC_${MAX_SYM}, above the allowed GLIBC_${{ env.MAX_GLIBC }}"
+            objdump -T "${BINARY}" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V -u
+            exit 1
+          fi
+          echo "glibc requirement OK"
+
+      - name: Determine package version
+        id: version
+        run: |
+          set -euo pipefail
+          CARGO_VER="$(awk -F'"' '/^\[package\]/{f=1} f && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+          if [ -z "${CARGO_VER}" ]; then
+            echo "::error::could not read version from Cargo.toml"
+            exit 1
+          fi
+          echo "Cargo.toml version: ${CARGO_VER}"
+          VERSION="${CARGO_VER}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "git tag overrides: ${VERSION}"
+          fi
+          if ! printf '%s' "${VERSION}" | grep -qE '^[0-9][A-Za-z0-9.+~:-]*$'; then
+            echo "::error::'${VERSION}' is not a valid Debian version string"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      # NOTE: every file below is written with printf, never a heredoc. A
+      # heredoc's terminator would have to sit at column 0, which would end
+      # this YAML block scalar and corrupt the workflow.
+      - name: Assemble .deb
+        id: deb
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCH="amd64"
+          DEB_NAME="spotifast_${VERSION}_bookworm_${ARCH}.deb"
+          STAGE="/tmp/deb-stage"
+          BINARY="${CARGO_TARGET_DIR}/release/spotifast"
+
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}/DEBIAN" "${STAGE}/usr/bin" \
+                   "${STAGE}/usr/share/applications" \
+                   "${STAGE}/usr/share/icons/hicolor/scalable/apps"
+
+          install -m755 "${BINARY}" "${STAGE}/usr/bin/spotifast"
+
+          DESKTOP_SRC=""
+          for c in packaging/applications/spotifast.desktop \
+                   packaging/linux/spotifast.desktop \
+                   contrib/spotifast.desktop; do
+            if [ -f "${c}" ]; then DESKTOP_SRC="${c}"; break; fi
+          done
+          if [ -n "${DESKTOP_SRC}" ]; then
+            install -m644 "${DESKTOP_SRC}" "${STAGE}/usr/share/applications/spotifast.desktop"
+            echo "desktop file: ${DESKTOP_SRC}"
+          else
+            echo "::warning::no upstream .desktop found; generating a fallback"
+            printf '%s\n' \
+              '[Desktop Entry]' \
+              'Type=Application' \
+              'Version=1.0' \
+              'Name=Spotifast' \
+              'GenericName=Music Player' \
+              'Comment=A native Spotify client' \
+              'Exec=spotifast %U' \
+              'Terminal=false' \
+              'Categories=AudioVideo;Audio;Player;Music;' \
+              'Keywords=spotify;music;player;streaming;spotifast;' \
+              'Icon=spotifast' \
+              'StartupNotify=true' \
+              'StartupWMClass=spotifast' \
+              'MimeType=x-scheme-handler/spotify;' \
+              > "${STAGE}/usr/share/applications/spotifast.desktop"
+          fi
+
+          ICON_SRC=""
+          for c in packaging/icons/spotifast.svg \
+                   packaging/icons/hicolor/scalable/apps/spotifast.svg \
+                   assets/spotifast.svg; do
+            if [ -f "${c}" ]; then ICON_SRC="${c}"; break; fi
+          done
+          if [ -n "${ICON_SRC}" ]; then
+            install -m644 "${ICON_SRC}" "${STAGE}/usr/share/icons/hicolor/scalable/apps/spotifast.svg"
+            echo "icon: ${ICON_SRC}"
+          else
+            echo "::warning::no upstream SVG icon found; package ships without an icon"
+          fi
+
+          INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "${STAGE}" | cut -f1)"
+          echo "Installed-Size: ${INSTALLED_SIZE} KiB"
+
+          printf '%s\n' \
+            'Package: spotifast' \
+            "Version: ${VERSION}" \
+            'Section: sound' \
+            'Priority: optional' \
+            "Architecture: ${ARCH}" \
+            "Installed-Size: ${INSTALLED_SIZE}" \
+            'Depends: libc6 (>= 2.36), libasound2, libpulse0, libxkbcommon0, libwayland-client0' \
+            'Maintainer: Spotifast Bookworm CI <noreply@localhost>' \
+            'Homepage: https://spotifast.rocks/' \
+            'Description: Spotify desktop client, native and fast' \
+            ' Spotifast is a native desktop client for Spotify written in Rust.' \
+            ' This build is compiled inside a Debian bookworm container so it' \
+            ' links against glibc 2.36 and installs on Debian 12.' \
+            'Rules-Requires-Root: no' \
+            > "${STAGE}/DEBIAN/control"
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'set -e' \
+            'case "$1" in' \
+            '  configure)' \
+            '    if command -v update-desktop-database >/dev/null 2>&1; then' \
+            '      update-desktop-database -q /usr/share/applications || true' \
+            '    fi' \
+            '    if command -v gtk-update-icon-cache >/dev/null 2>&1; then' \
+            '      gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true' \
+            '    fi' \
+            '    if command -v xdg-mime >/dev/null 2>&1; then' \
+            '      xdg-mime default spotifast.desktop x-scheme-handler/spotify || true' \
+            '    fi' \
+            '    ;;' \
+            'esac' \
+            'exit 0' \
+            > "${STAGE}/DEBIAN/postinst"
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'set -e' \
+            'case "$1" in' \
+            '  remove|purge)' \
+            '    if command -v update-desktop-database >/dev/null 2>&1; then' \
+            '      update-desktop-database -q /usr/share/applications || true' \
+            '    fi' \
+            '    if command -v gtk-update-icon-cache >/dev/null 2>&1; then' \
+            '      gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true' \
+            '    fi' \
+            '    ;;' \
+            'esac' \
+            'exit 0' \
+            > "${STAGE}/DEBIAN/postrm"
+
+          # Belt and braces: a bad maintainer script must never reach a user
+          # machine, because dpkg executes it at install time.
+          for s in postinst postrm; do
+            FIRST="$(head -1 "${STAGE}/DEBIAN/${s}")"
+            if [ "${FIRST}" != "#!/bin/sh" ]; then
+              echo "::error::${s} has shebang '${FIRST}', expected #!/bin/sh"
+              exit 1
+            fi
+          done
+
+          find "${STAGE}" -type d -exec chmod 0755 {} +
+          find "${STAGE}/usr" -type f -exec chmod 0644 {} +
+          chmod 0755 "${STAGE}/usr/bin/spotifast" \
+                    "${STAGE}/DEBIAN/postinst" "${STAGE}/DEBIAN/postrm"
+
+          dpkg-deb --build --root-owner-group "${STAGE}" "/tmp/${DEB_NAME}"
+          echo "built: /tmp/${DEB_NAME}"
+          ls -lh "/tmp/${DEB_NAME}"
+          dpkg-deb --info "/tmp/${DEB_NAME}"
+          echo "deb_path=/tmp/${DEB_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "deb_name=${DEB_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate desktop file
+        run: |
+          set -euo pipefail
+          DF="/tmp/deb-stage/usr/share/applications/spotifast.desktop"
+          desktop-file-validate "${DF}"
+          echo "desktop-file-validate OK"
+
+      - name: Lintian
+        run: |
+          set -euo pipefail
+          set +e
+          lintian \
+            --suppress-tags changelog-file-missing-in-native-package \
+            --suppress-tags no-changelog \
+            --suppress-tags maintainer-address-is-on-localhost \
+            --suppress-tags hardening-no-linkdef-env \
+            "${{ steps.deb.outputs.deb_path }}"
+          rc=$?
+          set -e
+          if [ ${rc} -eq 0 ]; then
+            echo "lintian clean"
+          elif [ ${rc} -eq 1 ]; then
+            echo "::warning::lintian reported warnings (non-fatal)"
+          else
+            echo "::error::lintian failed with ${rc}"
+            exit ${rc}
+          fi
+
+      - name: Smoke test (install, then launch headless)
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          DEB="${{ steps.deb.outputs.deb_path }}"
+          dpkg -i "${DEB}" || apt-get install -f -y --no-install-recommends
+
+          STATUS="$(dpkg-query -W -f='${db:Status-Abbrev}' spotifast 2>/dev/null | head -c2)"
+          if [ "${STATUS}" != "ii" ]; then
+            echo "::error::package state '${STATUS}', expected 'ii'"
+            dpkg -l spotifast || true
+            exit 1
+          fi
+          echo "install OK (ii)"
+          command -v spotifast
+
+          # A GUI app may ignore --version/--help and just try to open a
+          # window, so accept a timeout (124) but never a crash or a
+          # dynamic-loader failure (127).
+          SMOKE=0
+          timeout 20 xvfb-run --auto-servernum --server-args="-screen 0 1024x768x24" \
+            spotifast --version 2>&1 || SMOKE=$?
+          echo "smoke exit code: ${SMOKE}"
+          case "${SMOKE}" in
+            127)
+              echo "::error::dynamic loader rejected the binary (missing symbols)"
+              exit 1
+              ;;
+            134)
+              echo "::error::binary aborted (SIGABRT)"
+              exit 1
+              ;;
+            139)
+              echo "::error::binary segfaulted"
+              exit 1
+              ;;
+            124)
+              echo "app stayed running headlessly; no crash"
+              ;;
+          esac
+          if [ ${SMOKE} -ge 128 ] && [ ${SMOKE} -ne 124 ]; then
+            echo "::error::binary killed by signal $((SMOKE - 128))"
+            exit 1
+          fi
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.deb.outputs.deb_name }}
+          path: ${{ steps.deb.outputs.deb_path }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach .deb to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          DEB="${{ steps.deb.outputs.deb_path }}"
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \
+            || gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+                 --title "Spotifast ${{ steps.version.outputs.version }} for Debian bookworm" \
+                 --notes "Built from source inside a bookworm container (glibc 2.36)."
+          gh release upload "${TAG}" "${DEB}" --repo "${GITHUB_REPOSITORY}" --clobber
