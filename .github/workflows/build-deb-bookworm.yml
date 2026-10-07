@@ -40,34 +40,39 @@ jobs:
       - name: Assemble .deb
         run: |
           set -eu
+          version=$(dpkg-parsechangelog --version 2>/dev/null || echo "0.12.0")
+          case "$GITHUB_REF_NAME" in v*) version=${GITHUB_REF_NAME#v} ;; esac
           pkgroot=/tmp/pkg
-          mkdir -p "$pkgroot/DEBIAN"
-          install -Dm755 target/release/spotifast "$pkgroot/usr/bin/spotifast"
-          cp -r packaging/. "$pkgroot/usr/share/spotifast/" 2>/dev/null || true
-          find packaging -type f \( -name '*.desktop' -o -name '*.png' -o -name '*.svg' \) -exec install -D -m644 {} {} \;
-          if [ -f packaging/spotifast.desktop ]; then
-            install -m644 packaging/spotifast.desktop \
-              "$pkgroot/usr/share/applications/spotifast.desktop"
-          fi
+          mkdir -p "$pkgroot/DEBIAN" "$pkgroot/usr/bin" \
+                   "$pkgroot/usr/share/applications" \
+                   "$pkgroot/usr/share/icons/hicolor/scalable/apps"
+          install -m755 "$CARGO_TARGET_DIR/release/spotifast" "$pkgroot/usr/bin/spotifast"
+          install -m644 packaging/applications/spotifast.desktop \
+            "$pkgroot/usr/share/applications/spotifast.desktop"
+          install -m644 packaging/icons/spotifast.svg \
+            "$pkgroot/usr/share/icons/hicolor/scalable/apps/spotifast.svg"
           cat > "$pkgroot/DEBIAN/control" <<EOF
           Package: spotifast
-          Version: ${GITHUB_REF_NAME#v}
+          Version: $version
           Section: sound
           Priority: optional
           Architecture: amd64
           Maintainer: spotifast-ci <ci@example.com>
           Depends: libc6 (>= 2.36), libasound2, libpulse0, libxkbcommon0, libwayland-client0
           Description: A fast native Spotify desktop client
+           A native desktop client for Spotify, built from the upstream source
+           against glibc 2.36 so it installs on Debian 12.
           EOF
-          dpkg-deb --build --root-owner-group "$pkgroot" "spotifast_${GITHUB_REF_NAME#v}_bookworm_amd64.deb"
-          dpkg-deb --info "spotifast_${GITHUB_REF_NAME#v}_bookworm_amd64.deb"
+          printf '%s\n' "/usr/bin/spotifast" > "$pkgroot/DEBIAN/postinst"
+          printf '#!/bin/sh\nset -e\nif command -v update-desktop-database >/dev/null; then update-desktop-database -q /usr/share/applications || true; fi\nif command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true; fi\nexit 0\n' > "$pkgroot/DEBIAN/postrm"
+          chmod 755 "$pkgroot/DEBIAN/postinst" "$pkgroot/DEBIAN/postrm"
+          out="spotifast_${version}_bookworm_amd64.deb"
+          dpkg-deb --build --root-owner-group "$pkgroot" "$out"
+          dpkg-deb --info "$out"
+          echo "GLIBC symbols used (max):"
+          objdump -T "$pkgroot/usr/bin/spotifast" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1
 
       - uses: actions/upload-artifact@v4
         with:
           name: spotifast-bookworm-deb
           path: '*.deb'
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: spotifast-binary
-          path: target/release/spotifast
