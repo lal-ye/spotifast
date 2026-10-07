@@ -1,0 +1,72 @@
+name: Build Debian package (bookworm)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  deb-bookworm:
+    # Building inside a bookworm container keeps the produced binary linked
+    # against glibc 2.36, so the .deb runs on Debian 12 (GitHub's own runners
+    # have glibc 2.39, which Debian 12 cannot load).
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config cmake clang libclang-dev \
+            libasound2-dev libpulse-dev libxkbcommon-dev libwayland-dev \
+            desktop-file-utils hicolor-icon-theme
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "CARGO_HOME=/github/home/.cargo" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=/tmp/cargo-target" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - name: Build Spotifast
+        run: cargo build --release --locked
+
+      - name: Assemble .deb
+        run: |
+          set -eu
+          pkgroot=/tmp/pkg
+          mkdir -p "$pkgroot/DEBIAN"
+          install -Dm755 target/release/spotifast "$pkgroot/usr/bin/spotifast"
+          cp -r packaging/. "$pkgroot/usr/share/spotifast/" 2>/dev/null || true
+          find packaging -type f \( -name '*.desktop' -o -name '*.png' -o -name '*.svg' \) -exec install -D -m644 {} {} \;
+          if [ -f packaging/spotifast.desktop ]; then
+            install -m644 packaging/spotifast.desktop \
+              "$pkgroot/usr/share/applications/spotifast.desktop"
+          fi
+          cat > "$pkgroot/DEBIAN/control" <<EOF
+          Package: spotifast
+          Version: ${GITHUB_REF_NAME#v}
+          Section: sound
+          Priority: optional
+          Architecture: amd64
+          Maintainer: spotifast-ci <ci@example.com>
+          Depends: libc6 (>= 2.36), libasound2, libpulse0, libxkbcommon0, libwayland-client0
+          Description: A fast native Spotify desktop client
+          EOF
+          dpkg-deb --build --root-owner-group "$pkgroot" "spotifast_${GITHUB_REF_NAME#v}_bookworm_amd64.deb"
+          dpkg-deb --info "spotifast_${GITHUB_REF_NAME#v}_bookworm_amd64.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spotifast-bookworm-deb
+          path: '*.deb'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spotifast-binary
+          path: target/release/spotifast
