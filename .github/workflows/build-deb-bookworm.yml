@@ -82,9 +82,27 @@ jobs:
       - name: Install rustup
         run: |
           set -euo pipefail
+          # The container runs as root while HOME is /github/home, so rustup
+          # complains and can drop its shims somewhere other than CARGO_HOME.
+          # Pin both dirs explicitly and verify the shims really landed there.
+          export CARGO_HOME="/github/home/.cargo"
+          export RUSTUP_HOME="/github/home/.rustup"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain none --profile minimal
-          echo "PATH=${CARGO_HOME}/bin:${PATH}" >> "${GITHUB_PATH}"
+            | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+          for d in "${CARGO_HOME}/bin" /root/.cargo/bin /usr/local/cargo/bin; do
+            if [ -x "${d}/rustup" ]; then
+              echo "found rustup in ${d}"
+              mkdir -p /usr/local/bin
+              ln -sf "${d}/rustup" /usr/local/bin/rustup
+              ln -sf "${d}/cargo"  /usr/local/bin/cargo
+              ln -sf "${d}/rustc"  /usr/local/bin/rustc
+              break
+            fi
+          done
+          command -v rustup
+          command -v cargo
+          rustup --version
+          echo "PATH=${CARGO_HOME}/bin:/usr/local/bin:${PATH}" >> "${GITHUB_PATH}"
 
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -95,6 +113,9 @@ jobs:
       - name: Install pinned Rust toolchain
         run: |
           set -euo pipefail
+          export CARGO_HOME="/github/home/.cargo"
+          export RUSTUP_HOME="/github/home/.rustup"
+          export PATH="${CARGO_HOME}/bin:/usr/local/bin:${PATH}"
           echo "rust-toolchain.toml:"
           cat rust-toolchain.toml
           CHANNEL="$(sed -n 's/.*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | awk 'NR==1')"
@@ -117,6 +138,9 @@ jobs:
       - name: Build release binary
         run: |
           set -euo pipefail
+          export CARGO_HOME="/github/home/.cargo"
+          export RUSTUP_HOME="/github/home/.rustup"
+          export PATH="${CARGO_HOME}/bin:/usr/local/bin:${PATH}"
           export RUSTFLAGS="-C debuginfo=0"
           export SOURCE_DATE_EPOCH
           cargo build --release --locked
