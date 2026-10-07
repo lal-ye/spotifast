@@ -45,7 +45,15 @@ jobs:
       - name: Assert container glibc <= ${{ env.MAX_GLIBC }}
         run: |
           set -euo pipefail
-          GLIBC_VER="$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+$' | head -1)"
+          # NB: no `head` in these pipelines. head closes the pipe on the
+          # first line, the upstream command dies of SIGPIPE, and `pipefail`
+          # turns that into exit 141 and fails the step.
+          GLIBC_VER="$(ldd --version 2>&1 | awk 'match($0, /[0-9]+\.[0-9]+/) { print substr($0, RSTART, RLENGTH); exit }')"
+          if [ -z "${GLIBC_VER}" ]; then
+            echo "::error::could not determine container glibc version"
+            ldd --version 2>&1 || true
+            exit 1
+          fi
           echo "Container glibc: ${GLIBC_VER}"
           HIGHEST="$(printf '%s\n%s\n' "${GLIBC_VER}" "${{ env.MAX_GLIBC }}" | sort -V | tail -1)"
           if [ "${HIGHEST}" != "${{ env.MAX_GLIBC }}" ]; then
@@ -89,7 +97,7 @@ jobs:
           set -euo pipefail
           echo "rust-toolchain.toml:"
           cat rust-toolchain.toml
-          CHANNEL="$(sed -n 's/.*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)"
+          CHANNEL="$(sed -n 's/.*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | awk 'NR==1')"
           if [ -z "${CHANNEL}" ]; then
             echo "::warning::no channel in rust-toolchain.toml; falling back to stable"
             CHANNEL=stable
@@ -156,7 +164,7 @@ jobs:
             VERSION="${GITHUB_REF_NAME#v}"
             echo "git tag overrides: ${VERSION}"
           fi
-          if ! printf '%s' "${VERSION}" | grep -qE '^[0-9][A-Za-z0-9.+~:-]*$'; then
+          if ! [[ "${VERSION}" =~ ^[0-9][A-Za-z0-9.+~:-]*$ ]]; then
             echo "::error::'${VERSION}' is not a valid Debian version string"
             exit 1
           fi
@@ -336,7 +344,7 @@ jobs:
           DEB="${{ steps.deb.outputs.deb_path }}"
           dpkg -i "${DEB}" || apt-get install -f -y --no-install-recommends
 
-          STATUS="$(dpkg-query -W -f='${db:Status-Abbrev}' spotifast 2>/dev/null | head -c2)"
+          STATUS="$(dpkg-query -W -f='${db:Status-Abbrev}' spotifast 2>/dev/null | cut -c1-2)"
           if [ "${STATUS}" != "ii" ]; then
             echo "::error::package state '${STATUS}', expected 'ii'"
             dpkg -l spotifast || true
