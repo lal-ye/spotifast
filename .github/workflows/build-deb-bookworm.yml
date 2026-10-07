@@ -343,19 +343,34 @@ jobs:
       - name: Lintian
         run: |
           set -euo pipefail
+          DEB="${{ steps.deb.outputs.deb_path }}"
+          SUPPRESS="changelog-file-missing-in-native-package no-changelog maintainer-address-is-on-localhost"
+
+          ARGS=()
+          for t in ${SUPPRESS}; do ARGS+=(--suppress-tags "${t}"); done
+
           set +e
-          lintian \
-            --suppress-tags changelog-file-missing-in-native-package \
-            --suppress-tags no-changelog \
-            --suppress-tags maintainer-address-is-on-localhost \
-            --suppress-tags hardening-no-linkdef-env \
-            "${{ steps.deb.outputs.deb_path }}"
+          OUTPUT="$(lintian "${ARGS[@]}" "${DEB}" 2>&1)"
           rc=$?
           set -e
+          printf '%s\n' "${OUTPUT}"
+
+          # An unknown --suppress-tags value makes lintian exit 25 ("fatal
+          # errors") *before it ever inspects the package*, which is
+          # indistinguishable from a genuine packaging error. Catch it by
+          # name so the message names the real cause.
+          if printf '%s' "${OUTPUT}" | grep -q 'Unknown tag'; then
+            echo "::error::lintian in this image does not know one of: ${SUPPRESS}"
+            exit 1
+          fi
+          echo "lintian exit code: ${rc}"
+
+          # 0 = clean, 1 = warnings only. Anything else means lintian itself
+          # could not run or found errors; do not paper over it.
           if [ ${rc} -eq 0 ]; then
             echo "lintian clean"
           elif [ ${rc} -eq 1 ]; then
-            echo "::warning::lintian reported warnings (non-fatal)"
+            echo "::warning::lintian reported warnings only (non-fatal)"
           else
             echo "::error::lintian failed with ${rc}"
             exit ${rc}
