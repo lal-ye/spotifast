@@ -34,6 +34,12 @@ jobs:
       image: debian:bookworm@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858
       options: --user root
 
+    # Container jobs default to `sh -e` (dash), which has no `pipefail` and
+    # no `sort -V` quirks handled the same way. Force bash on every run step.
+    defaults:
+      run:
+        shell: bash
+
     steps:
       # ── Guard 1: the container itself must not be newer than MAX_GLIBC ──
       - name: Assert container glibc <= ${{ env.MAX_GLIBC }}
