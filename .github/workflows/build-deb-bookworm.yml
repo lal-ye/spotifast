@@ -256,9 +256,27 @@ jobs:
             echo "::warning::no upstream SVG icon found; package ships without an icon"
           fi
 
+          # Lintian error no-copyright-file: ship the upstream MIT licence in
+          # machine-readable form so dpkg/copyright works on this package.
+          mkdir -p "${STAGE}/usr/share/doc/spotifast"
+          if [ -f LICENSE ]; then
+            {
+              printf '%s\n' \
+                'Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/' \
+                'Upstream-Name: spotifast' \
+                'Source: https://github.com/crmne/spotifast' \
+                'Files: *' \
+                'Copyright: 2025 Spotifast contributors'
+              printf '\nLicense: MIT\n'
+              sed -e 's/^/ /' LICENSE
+            } > "${STAGE}/usr/share/doc/spotifast/copyright"
+          fi
+
           INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "${STAGE}" | cut -f1)"
           echo "Installed-Size: ${INSTALLED_SIZE} KiB"
 
+          # No Rules-Requires-Root field: it only exists in dpkg from trixie
+          # onwards and bookworm's lintian flags it as unknown-field.
           printf '%s\n' \
             'Package: spotifast' \
             "Version: ${VERSION}" \
@@ -273,7 +291,6 @@ jobs:
             ' Spotifast is a native desktop client for Spotify written in Rust.' \
             ' This build is compiled inside a Debian bookworm container so it' \
             ' links against glibc 2.36 and installs on Debian 12.' \
-            'Rules-Requires-Root: no' \
             > "${STAGE}/DEBIAN/control"
 
           printf '%s\n' \
@@ -344,7 +361,7 @@ jobs:
         run: |
           set -euo pipefail
           DEB="${{ steps.deb.outputs.deb_path }}"
-          SUPPRESS="changelog-file-missing-in-native-package no-changelog maintainer-address-is-on-localhost"
+          SUPPRESS="changelog-file-missing-in-native-package no-changelog maintainer-address-is-on-localhost no-manual-page"
 
           ARGS=()
           for t in ${SUPPRESS}; do ARGS+=(--suppress-tags "${t}"); done
